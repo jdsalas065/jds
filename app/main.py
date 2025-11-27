@@ -1,3 +1,4 @@
+from contextlib import asynccontextmanager
 from fastapi import FastAPI, File, UploadFile, HTTPException
 from fastapi.responses import Response, JSONResponse, FileResponse
 from fastapi.middleware.cors import CORSMiddleware
@@ -5,10 +6,13 @@ import os
 import asyncio
 import uuid
 import logging
+import io
+from PIL import Image
 from rembg import remove
 from prometheus_client import Counter, Histogram, generate_latest, CONTENT_TYPE_LATEST
 import redis
 import json
+from app.celery_app import celery_app
 
 # Config via env
 MAX_UPLOAD_MB = int(os.getenv("MAX_UPLOAD_MB", "15"))
@@ -26,7 +30,31 @@ os.makedirs(RESULT_DIR, exist_ok=True)
 # Redis client for job metadata (used in async flow)
 redis_client = redis.from_url(REDIS_URL, decode_responses=True)
 
-app = FastAPI(title="rembg-fastapi", version="0.2")
+logger = logging.getLogger("rembg-service")
+logging.basicConfig(level=os.getenv("LOG_LEVEL", "INFO"))
+
+# Prometheus metrics
+REQ_COUNT = Counter("rembg_requests_total", "Total requests", ["endpoint", "method", "status"])
+INFER_HIST = Histogram("rembg_inference_seconds", "Inference processing time seconds")
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    logger.info("Starting rembg-fastapi...")
+    if MODEL_PREWARM:
+        # Pre-warm model to avoid first-request latency
+        try:
+            logger.info("Pre-warming model (running a tiny inference)...")
+            buf = io.BytesIO()
+            Image.new("RGB", (1, 1), (255, 0, 0)).save(buf, format="PNG")
+            dummy = buf.getvalue()
+            await asyncio.to_thread(remove, dummy)
+            logger.info("Model pre-warm completed.")
+        except Exception as e:
+            logger.exception("Model pre-warm failed: %s", e)
+    yield
+    logger.info("Shutting down rembg-fastapi...")
+
+app = FastAPI(title="rembg-fastapi", version="0.2", lifespan=lifespan)
 
 # CORS (tighten in prod)
 app.add_middleware(
@@ -36,30 +64,6 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
-
-logger = logging.getLogger("rembg-service")
-logging.basicConfig(level=os.getenv("LOG_LEVEL", "INFO"))
-
-# Prometheus metrics
-REQ_COUNT = Counter("rembg_requests_total", "Total requests", ["endpoint", "method", "status"])
-INFER_HIST = Histogram("rembg_inference_seconds", "Inference processing time seconds")
-
-@app.on_event("startup")
-async def startup_event():
-    logger.info("Starting rembg-fastapi...")
-    if MODEL_PREWARM:
-        # Pre-warm model to avoid first-request latency
-        try:
-            logger.info("Pre-warming model (running a tiny inference)...")
-            import io
-            from PIL import Image
-            buf = io.BytesIO()
-            Image.new("RGB", (1, 1), (255, 0, 0)).save(buf, format="PNG")
-            dummy = buf.getvalue()
-            await asyncio.to_thread(remove, dummy)
-            logger.info("Model pre-warm completed.")
-        except Exception as e:
-            logger.exception("Model pre-warm failed: %s", e)
 
 @app.get("/health")
 async def health():
@@ -122,7 +126,6 @@ async def remove_async(file: UploadFile = File(...)):
         with open(upload_path, "wb") as f:
             f.write(contents)
 
-        from app.celery_app import celery_app
         meta = {"status": "PENDING", "upload_path": upload_path}
         redis_client.set(f"job:{job_id}", json.dumps(meta))
 
