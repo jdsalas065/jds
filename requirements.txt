@@ -1,0 +1,8 @@
+fastapi>=0.104.0
+uvicorn[standard]>=0.24.0
+python-multipart>=0.0.6
+rembg>=2.0.50
+pillow>=10.0.0
+prometheus-client>=0.19.0
+redis>=5.0.0
+celery>=5.3.0
