@@ -204,6 +204,10 @@ async def remove_background(file: UploadFile = File(...)):
         # === VALIDATION - Kiểm tra file ===
         # Kiểm tra content type phải là image
         # Check content type must be image
+        # NOTE: Content-type có thể bị giả mạo (spoofed)
+        # NOTE: Content-type can be spoofed
+        # TODO: Xem xét validate thêm bằng cách đọc file headers (magic bytes)
+        # TODO: Consider additional validation by reading file headers (magic bytes)
         if not file.content_type.startswith("image/"):
             REQ_COUNT.labels(endpoint=endpoint, method="POST", status="400").inc()
             raise HTTPException(status_code=400, detail="Uploaded file must be an image")
@@ -282,6 +286,10 @@ async def remove_async(file: UploadFile = File(...)):
     endpoint = "/remove-async"
     try:
         # === VALIDATION - Kiểm tra file ===
+        # NOTE: Content-type có thể bị giả mạo (spoofed)
+        # NOTE: Content-type can be spoofed
+        # TODO: Xem xét validate thêm bằng cách đọc file headers (magic bytes)
+        # TODO: Consider additional validation by reading file headers (magic bytes)
         if not file.content_type.startswith("image/"):
             REQ_COUNT.labels(endpoint=endpoint, method="POST", status="400").inc()
             raise HTTPException(status_code=400, detail="Uploaded file must be an image")
