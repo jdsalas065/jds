@@ -323,6 +323,363 @@ app.add_middleware(
 )
 ```
 
+## Chiến lược Scale / Scaling Strategies
+
+### Khi nào cần scale? / When to scale?
+
+Cần scale khi gặp các dấu hiệu sau:
+- Request latency tăng cao
+- Queue length trong Redis ngày càng dài
+- CPU/Memory usage cao liên tục
+- Có nhiều API endpoints và tasks hơn
+
+### 1. Scale Horizontal - Thêm instances / Add more instances
+
+#### Cấu trúc hiện tại (Đơn giản - Simple)
+```
+┌─────────────┐
+│  FastAPI    │  1 instance
+└─────────────┘
+       │
+┌─────────────┐
+│   Redis     │  1 instance
+└─────────────┘
+       │
+┌─────────────┐
+│  Celery     │  1 worker
+│  Worker     │
+└─────────────┘
+```
+
+#### Cấu trúc khi scale (Recommended for production)
+```
+                    ┌──────────────┐
+                    │ Load Balancer│
+                    │  (Nginx/ALB) │
+                    └──────┬───────┘
+                           │
+        ┏━━━━━━━━━━━━━━━━━┻━━━━━━━━━━━━━━━━━┓
+        ▼                  ▼                  ▼
+┌──────────────┐  ┌──────────────┐  ┌──────────────┐
+│  FastAPI #1  │  │  FastAPI #2  │  │  FastAPI #3  │
+└──────────────┘  └──────────────┘  └──────────────┘
+        │                  │                  │
+        └──────────────────┼──────────────────┘
+                           ▼
+                  ┌─────────────────┐
+                  │  Redis Cluster  │
+                  │  (HA setup)     │
+                  └────────┬────────┘
+                           │
+        ┏━━━━━━━━━━━━━━━━━┻━━━━━━━━━━━━━━━━━┓
+        ▼                  ▼                  ▼
+┌──────────────┐  ┌──────────────┐  ┌──────────────┐
+│  Worker #1   │  │  Worker #2   │  │  Worker #3   │
+│  (Queue: A)  │  │  (Queue: B)  │  │  (Queue: C)  │
+└──────────────┘  └──────────────┘  └──────────────┘
+```
+
+**Cách thực hiện / How to implement:**
+
+```bash
+# Scale FastAPI với Docker Compose
+docker-compose up --scale api=3
+
+# Scale Celery workers
+docker-compose up --scale worker=5
+
+# Hoặc chạy workers riêng biệt với queues khác nhau
+celery -A app.celery_app worker -Q queue1 --concurrency=4
+celery -A app.celery_app worker -Q queue2 --concurrency=4
+celery -A app.celery_app worker -Q queue3 --concurrency=4
+```
+
+### 2. Tổ chức lại code khi có nhiều APIs / Reorganize code with many APIs
+
+#### Cấu trúc hiện tại (Tất cả trong 1 file - All in one file)
+```
+app/
+├── main.py           # Tất cả endpoints ở đây (All endpoints here)
+├── celery_app.py
+└── tasks.py          # Tất cả tasks ở đây (All tasks here)
+```
+
+**Vấn đề / Problems:**
+- File `main.py` sẽ rất dài và khó maintain
+- Khó phân chia công việc cho team
+- Khó test từng module riêng
+
+#### Cấu trúc nên dùng (Module hóa - Modular)
+```
+app/
+├── __init__.py
+├── main.py                    # Application setup only
+├── core/
+│   ├── __init__.py
+│   ├── config.py             # Configuration
+│   ├── dependencies.py       # Shared dependencies
+│   └── security.py           # Auth, CORS, etc.
+├── api/
+│   ├── __init__.py
+│   ├── v1/                   # API version 1
+│   │   ├── __init__.py
+│   │   ├── endpoints/
+│   │   │   ├── __init__.py
+│   │   │   ├── images.py     # Image-related endpoints
+│   │   │   ├── users.py      # User-related endpoints
+│   │   │   └── jobs.py       # Job-related endpoints
+│   │   └── router.py         # Router cho v1
+│   └── v2/                   # API version 2 (future)
+│       └── ...
+├── models/
+│   ├── __init__.py
+│   ├── image.py              # Pydantic models cho images
+│   ├── user.py               # Pydantic models cho users
+│   └── job.py                # Pydantic models cho jobs
+├── services/
+│   ├── __init__.py
+│   ├── image_service.py      # Business logic cho images
+│   ├── user_service.py       # Business logic cho users
+│   └── job_service.py        # Business logic cho jobs
+├── workers/
+│   ├── __init__.py
+│   ├── celery_app.py         # Celery config
+│   └── tasks/
+│       ├── __init__.py
+│       ├── image_tasks.py    # Image processing tasks
+│       ├── email_tasks.py    # Email sending tasks
+│       └── report_tasks.py   # Report generation tasks
+├── db/
+│   ├── __init__.py
+│   ├── database.py           # Database connection
+│   └── repositories/
+│       ├── __init__.py
+│       ├── image_repo.py
+│       └── user_repo.py
+└── utils/
+    ├── __init__.py
+    ├── validators.py
+    └── helpers.py
+```
+
+**Ví dụ main.py mới / Example new main.py:**
+
+```python
+from fastapi import FastAPI
+from app.core.config import settings
+from app.core.dependencies import setup_middleware
+from app.api.v1.router import api_router as v1_router
+from app.api.v2.router import api_router as v2_router
+
+app = FastAPI(title=settings.PROJECT_NAME, version=settings.VERSION)
+
+# Setup middleware
+setup_middleware(app)
+
+# Include routers theo version
+app.include_router(v1_router, prefix="/api/v1")
+app.include_router(v2_router, prefix="/api/v2")
+
+@app.get("/health")
+async def health():
+    return {"status": "ok"}
+```
+
+**Ví dụ endpoint file / Example endpoint file:**
+
+```python
+# app/api/v1/endpoints/images.py
+from fastapi import APIRouter, File, UploadFile, Depends
+from app.services.image_service import ImageService
+from app.models.image import ImageResponse
+
+router = APIRouter()
+
+@router.post("/remove", response_model=ImageResponse)
+async def remove_background(
+    file: UploadFile = File(...),
+    service: ImageService = Depends()
+):
+    """Xóa background đồng bộ / Sync background removal"""
+    return await service.remove_background_sync(file)
+
+@router.post("/remove-async", response_model=dict)
+async def remove_background_async(
+    file: UploadFile = File(...),
+    service: ImageService = Depends()
+):
+    """Xóa background bất đồng bộ / Async background removal"""
+    return await service.remove_background_async(file)
+```
+
+### 3. Tách Celery queues theo loại tasks / Separate Celery queues by task type
+
+**Cấu trúc hiện tại (1 queue - Single queue):**
+```python
+# Tất cả tasks vào 1 queue "rembg"
+task_routes = {
+    "app.tasks.remove_background_task": {"queue": "rembg"},
+}
+```
+
+**Cấu trúc nên dùng (Multiple queues):**
+```python
+# app/workers/celery_app.py
+task_routes = {
+    # Queue cho image processing (priority cao)
+    "app.workers.tasks.image_tasks.remove_background": {"queue": "images_high"},
+    "app.workers.tasks.image_tasks.resize_image": {"queue": "images_low"},
+    
+    # Queue cho email (priority thấp)
+    "app.workers.tasks.email_tasks.send_email": {"queue": "emails"},
+    
+    # Queue cho reports (có thể chạy lâu)
+    "app.workers.tasks.report_tasks.generate_report": {"queue": "reports"},
+    
+    # Queue cho cleanup (chạy định kỳ)
+    "app.workers.tasks.cleanup_tasks.delete_old_files": {"queue": "maintenance"},
+}
+```
+
+**Chạy workers chuyên biệt / Run specialized workers:**
+```bash
+# Worker cho image processing (nhiều resources)
+celery -A app.workers.celery_app worker -Q images_high -c 4 --max-tasks-per-child=10
+
+# Worker cho emails (ít resources)
+celery -A app.workers.celery_app worker -Q emails -c 2
+
+# Worker cho reports (chạy lâu, ít concurrency)
+celery -A app.workers.celery_app worker -Q reports -c 1 --time-limit=3600
+
+# Worker xử lý nhiều queues (flexible)
+celery -A app.workers.celery_app worker -Q images_low,emails,maintenance -c 2
+```
+
+### 4. Thêm Database khi scale / Add Database when scaling
+
+**Hiện tại:** Dùng Redis để lưu job metadata (tạm thời)
+
+**Khi scale:** Nên dùng database riêng (PostgreSQL, MongoDB) để:
+- Lưu trữ lâu dài (persistent storage)
+- Query phức tạp (complex queries)
+- Relationship giữa entities
+- Audit logs
+
+**Cấu trúc với Database:**
+```
+┌──────────────┐
+│   FastAPI    │
+└──────┬───────┘
+       │
+       ├─────────► Redis (Cache + Session)
+       │
+       ├─────────► PostgreSQL (Main data)
+       │           • Users
+       │           • Jobs history
+       │           • Files metadata
+       │           • Audit logs
+       │
+       └─────────► S3/MinIO (File storage)
+                   • Uploaded files
+                   • Processed results
+```
+
+### 5. Rate Limiting và Caching
+
+```python
+# Thêm rate limiting
+from slowapi import Limiter, _rate_limit_exceeded_handler
+from slowapi.util import get_remote_address
+
+limiter = Limiter(key_func=get_remote_address)
+app.state.limiter = limiter
+
+@app.post("/remove")
+@limiter.limit("10/minute")  # 10 requests per minute
+async def remove_background(request: Request, file: UploadFile = File(...)):
+    ...
+
+# Thêm caching với Redis
+from fastapi_cache import FastAPICache
+from fastapi_cache.backends.redis import RedisBackend
+from fastapi_cache.decorator import cache
+
+@cache(expire=3600)  # Cache 1 hour
+@app.get("/status/{job_id}")
+async def get_status(job_id: str):
+    ...
+```
+
+### 6. Monitoring và Observability khi scale
+
+```python
+# Thêm distributed tracing với OpenTelemetry
+from opentelemetry import trace
+from opentelemetry.exporter.jaeger import JaegerExporter
+from opentelemetry.sdk.trace import TracerProvider
+from opentelemetry.sdk.trace.export import BatchSpanProcessor
+
+# Setup tracing
+trace.set_tracer_provider(TracerProvider())
+jaeger_exporter = JaegerExporter(
+    agent_host_name="localhost",
+    agent_port=6831,
+)
+trace.get_tracer_provider().add_span_processor(
+    BatchSpanProcessor(jaeger_exporter)
+)
+
+# Thêm structured logging
+import structlog
+
+logger = structlog.get_logger()
+logger.info("processing_job", job_id=job_id, user_id=user_id)
+```
+
+### 7. API Versioning
+
+```python
+# Hỗ trợ nhiều versions của API
+app.include_router(v1_router, prefix="/api/v1", tags=["v1"])
+app.include_router(v2_router, prefix="/api/v2", tags=["v2"])
+
+# Hoặc dùng header-based versioning
+@app.middleware("http")
+async def api_version_middleware(request: Request, call_next):
+    version = request.headers.get("API-Version", "v1")
+    request.state.api_version = version
+    response = await call_next(request)
+    return response
+```
+
+### Tóm tắt thay đổi khi scale / Summary of changes when scaling
+
+| Aspect | Hiện tại / Current | Khi scale / When scaling |
+|--------|-------------------|-------------------------|
+| **Code Structure** | 1 file main.py | Modules: api/, services/, workers/ |
+| **API Organization** | Tất cả endpoints trong 1 file | Tách theo feature + versioning |
+| **Workers** | 1 worker, 1 queue | Multiple workers, multiple queues |
+| **Storage** | Redis only | Redis + Database + Object Storage |
+| **Scaling** | Vertical (tăng resources) | Horizontal (thêm instances) |
+| **Monitoring** | Prometheus basic | Prometheus + Grafana + Tracing |
+| **Caching** | Không có | Redis caching layer |
+| **Rate Limiting** | Không có | Rate limiting per user/IP |
+| **Load Balancing** | Không có | Nginx/ALB load balancer |
+| **Database** | Không có | PostgreSQL/MongoDB |
+| **Auth** | Không có | JWT/OAuth2 authentication |
+
+### Migration path từ cấu trúc hiện tại / Migration from current structure
+
+**Bước 1:** Tách endpoints ra thành modules (không breaking changes)
+**Bước 2:** Thêm database để lưu metadata
+**Bước 3:** Tách workers thành nhiều queues
+**Bước 4:** Thêm load balancer và scale horizontal
+**Bước 5:** Thêm caching, rate limiting, monitoring
+**Bước 6:** Implement API versioning
+
+Có thể làm từng bước một mà không cần refactor toàn bộ cùng lúc!
+
 ## Tài liệu tham khảo / References
 
 - [FastAPI Documentation](https://fastapi.tiangolo.com/)
